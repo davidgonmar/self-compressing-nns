@@ -6,8 +6,15 @@ import torchvision
 from tqdm import tqdm
 import operator
 import functools
+from typing import Dict, Sequence
 
 
+# ********* UTILS *********
+def prod(seq: Sequence[int]) -> int:
+    return functools.reduce(operator.mul, seq, 1)
+
+
+# ********* QUANTIZATION *********
 class STERound(torch.autograd.Function):
     @staticmethod
     def forward(_, x: Tensor) -> Tensor:
@@ -28,17 +35,14 @@ def q(x: Tensor, b: Tensor, e: Tensor) -> Tensor:
     )
 
 
-def prod(seq):
-    return functools.reduce(operator.mul, seq, 1)
-
-
+# ********* MODEL *********
 class QConv2d(nn.Conv2d):
     def __init__(self, *args, **kwargs):
         super(QConv2d, self).__init__(*args, **kwargs)
         out_channels = self.weight.size()[0]
         self.e = nn.Parameter(torch.full((out_channels, 1, 1, 1), -8).to(torch.float32))
         self._b = nn.Parameter(
-            torch.full((out_channels, 1, 1, 1), 2).to(torch.float32)
+            torch.full((out_channels, 1, 1, 1), 8).to(torch.float32)
         )  # 8-bit quantization at the beginning
 
     @property
@@ -61,57 +65,128 @@ class QConv2d(nn.Conv2d):
         )
 
 
+class Reshape(nn.Module):
+    def __init__(self, shape: Sequence[int]):
+        super(Reshape, self).__init__()
+        self.shape = shape
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x.reshape(*self.shape)
+
+
 class SelfCompressingNN(nn.Module):
     def __init__(self):
         super(SelfCompressingNN, self).__init__()
-        self.conv1 = QConv2d(3, 64, 3, padding=1)
-        self.conv2 = QConv2d(64, 64, 3, padding=1)
-        self.conv3 = QConv2d(64, 128, 3, padding=1)
-        self.conv4 = QConv2d(128, 128, 3, padding=1)
-        self.conv_linear = QConv2d(128 * 8 * 8, 10, 1)  # acts as a linear layer
-        self.bn1 = nn.BatchNorm2d(64)
-        self.bn2 = nn.BatchNorm2d(128)
+        self.seq = nn.Sequential(
+            QConv2d(3, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            QConv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            QConv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            QConv2d(256, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            QConv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            QConv2d(512, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            QConv2d(256, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            QConv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            QConv2d(
+                64, 10, 4, padding=0
+            ),  # simulates a fully connected layer with conv2d. Expects inpujt of size (b, 64, 4, 4)
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = self.bn1(x)
-        x = F.max_pool2d(x, 2, 2)
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
-        x = self.bn2(x)
-        x = F.max_pool2d(x, 2, 2)
-        x = x.view(-1).view(-1, 128 * 8 * 8, 1, 1)
-        x = F.relu(self.conv_linear(x))  # acts as a linear layer
-        return x.view(-1, 10)
+        return self.seq(x).reshape(x.size(0), -1)
 
+    def quant_loss(self) -> Tensor:
+        convs = [layer for layer in self.seq.modules() if isinstance(layer, QConv2d)]
 
-def loss_to_minimize_bits(model: SelfCompressingNN) -> Tensor:
-    total_weights = sum(
-        [
-            layer.weight.numel()
-            for layer in model.modules()
-            if isinstance(layer, QConv2d)
-        ]
-    )
-    return (
-        sum(
-            [
-                layer.bits_used() if hasattr(layer, "bits_used") else 0
-                for layer in model.modules()
-            ]
+        def conv_cost(prev: QConv2d, out: QConv2d) -> Tensor:
+            outcost = (
+                prod(out.weight.shape[2:])
+                * (
+                    torch.where(prev.b > 0, 1, 0).reshape(-1, 1) * out.b.reshape(1, -1)
+                ).sum()
+            )
+            prevcost = (
+                prod(prev.weight.shape[2:])
+                * (
+                    torch.where(out.b > 0, 1, 0).reshape(-1, 1) * prev.b.reshape(1, -1)
+                ).sum()
+            )
+            return outcost + prevcost
+
+        total_weights = sum([layer.weight.numel() for layer in convs])
+        return (
+            sum([conv_cost(prev, out) for prev, out in zip(convs, convs[1:])])
+            / total_weights
         )
-        / total_weights
-    )
+
+    def get_params(self) -> Dict[str, list[nn.Parameter]]:
+        d = {"quant": [], "other": []}
+        for name, param in self.named_parameters():
+            if name.endswith("b") or name.endswith("e"):
+                d["quant"].append(param)
+            else:
+                d["other"].append(param)
+        return d
+
+    def get_stats(self) -> Dict[str, float]:
+        d = {
+            "total": 0,
+            "used": 0,
+            "pruned": 0,
+            "avg_bits_all_channels": 0,
+            "avg_bits_used_channels": 0,
+            "orig_kb_size": 0,
+            "current_kb_size": 0,
+        }
+        for layer in self.modules():
+            if isinstance(layer, QConv2d):
+                wshape = layer.weight.shape
+                total = prod(wshape)
+                pruned = (layer.b == 0).sum().item() * prod(wshape[1:])
+                used = total - pruned
+                d["total"] += total
+                d["used"] += used
+                d["pruned"] += pruned
+                d["avg_bits_all_channels"] += layer.bits_used().item() / total
+                d["avg_bits_used_channels"] += layer.bits_used().item() / used
+                d["orig_kb_size"] += total * 32 / 8 / 1024
+                d["current_kb_size"] += layer.bits_used().item() / 8 / 1024
+
+        d["avg_bits_all_channels"] /= len(
+            [layer for layer in self.modules() if isinstance(layer, QConv2d)]
+        )
+        d["avg_bits_used_channels"] /= len(
+            [layer for layer in self.modules() if isinstance(layer, QConv2d)]
+        )
+
+        return d
 
 
-def get_validation(
+def validate(
     model: SelfCompressingNN,
-    xentropy_crit: nn.CrossEntropyLoss,
     valloader: torch.utils.data.DataLoader,
     device: str,
 ) -> Tensor:
     model.eval()
+    xentropy_crit = nn.CrossEntropyLoss()
     with torch.no_grad():
         xent = 0
         total_right = 0
@@ -120,58 +195,66 @@ def get_validation(
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
             xent += xentropy_crit(outputs, targets)
-            _, predicted = outputs.max(1)
+            predicted = outputs.argmax(1)
             total += targets.size(0)
             total_right += predicted.eq(targets).sum().item()
         return xent / len(valloader), total_right / total
 
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--y", type=float, default=0.015)
-    args = parser.parse_args()
-
-    torch.manual_seed(0)
-    torch.cuda.set_device(0)
-    device = "cuda"
-
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cifar_stats = ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     model = SelfCompressingNN().to(device)
-    # model = torch.compile(model)
-    optim = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    if args.checkpoint is not None:
+        model.load_state_dict(torch.load(args.checkpoint))
+
+    model = torch.compile(model)
+    params = model.get_params()
+    optim = torch.optim.Adam(
+        [
+            {"params": params["quant"], "lr": args.lr_quant, "eps": args.eps_quant},
+            {
+                "params": params["other"],
+                "lr": args.lr_other,
+                "eps": args.eps_other,
+                "weight_decay": args.weight_decay_other,
+            },
+        ]
+    )
+
+    import torchvision.transforms as transforms
+
+    trans = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.AutoAugment(policy=transforms.AutoAugmentPolicy.CIFAR10),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(*cifar_stats),
+        ]
+    )
     xentropy_crit = nn.CrossEntropyLoss()
     cifar = torchvision.datasets.CIFAR10(
-        root="./data",
-        train=True,
-        download=True,
-        transform=torchvision.transforms.ToTensor(),
+        root="./data", train=True, download=True, transform=trans
     )
     cifar_val = torchvision.datasets.CIFAR10(
         root="./data",
         train=False,
         download=True,
-        transform=torchvision.transforms.ToTensor(),
+        transform=transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(*cifar_stats),
+            ]
+        ),
     )
     trainloader = torch.utils.data.DataLoader(
         cifar, batch_size=args.batch_size, shuffle=True, num_workers=2
     )
     valloader = torch.utils.data.DataLoader(
-        cifar_val, batch_size=args.batch_size, shuffle=False, num_workers=2
+        cifar_val, batch_size=args.batch_size * 2, shuffle=False, num_workers=2
     )
-
-    def extract_bits_used(model: SelfCompressingNN) -> float:
-        total = 0
-        for layer in model.modules():
-            if isinstance(layer, QConv2d):
-                wshape = layer.weight.shape
-                total += layer.b.sum().item() * prod(wshape[1:])
-        return total
-
     for epoch in range(args.epochs):
         pbar = tqdm(trainloader, desc="Training", position=0)
         model.train()
@@ -180,16 +263,69 @@ if __name__ == "__main__":
             optim.zero_grad()
             outputs = model(inputs)
             xent = xentropy_crit(outputs, targets)
-            bits_loss = loss_to_minimize_bits(model)
-            (xent + args.y * bits_loss).backward()
-            bits_used_by_convs = extract_bits_used(model)
-            kbs = bits_used_by_convs / 8 / 1024
+            (xent + args.y * model.quant_loss()).backward()
             optim.step()
-            pbar.set_postfix(
-                {"xentropy": f"{xent.item():.4f}", "KBs": f"{kbs:.4f}", "epoch": epoch}
-            )
+            pbar.set_postfix({"xentropy": f"{xent.item():.4f}", "epoch": epoch})
+        torch.save(model._orig_mod.state_dict(), "model.pth")
 
-        val_xent, val_acc = get_validation(model, xentropy_crit, valloader, device)
+        val_xent, val_acc = validate(model, valloader, device)
+        stats = model.get_stats()
         print(
-            f"Validation cross-entropy: {val_xent.item()}, Validation accuracy: {val_acc}"
+            f"Validation cross-entropy: {val_xent.item()}, Validation accuracy: {val_acc}, Original size:\
+                  {stats['orig_kb_size']:.2f}KB, Current size: {stats['current_kb_size']:.2f}KB, Average bits used per channel:\
+                      {stats['avg_bits_all_channels']:.2f}, Average bits used per channel (excluding pruned): {stats['avg_bits_used_channels']:.2f}"
         )
+
+
+def run_validation(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cifar_stats = ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    model = SelfCompressingNN().to(device)
+    model.load_state_dict(torch.load(args.checkpoint))
+    model = torch.compile(model)
+    import torchvision.transforms as transforms
+
+    cifar_val = torchvision.datasets.CIFAR10(
+        root="./data",
+        train=False,
+        download=True,
+        transform=transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(*cifar_stats),
+            ]
+        ),
+    )
+    valloader = torch.utils.data.DataLoader(
+        cifar_val, batch_size=args.batch_size * 2, shuffle=False, num_workers=2
+    )
+    val_xent, val_acc = validate(model, valloader, device)
+    stats = model.get_stats()
+
+    print(
+        f"Validation cross-entropy: {val_xent.item()}, Validation accuracy: {val_acc}, Original size:\
+                {stats['orig_kb_size']:.2f}KB, Current size: {stats['current_kb_size']:.2f}KB, Average bits used per channel:\
+                    {stats['avg_bits_all_channels']:.2f}, Average bits used per channel (excluding pruned): {stats['avg_bits_used_channels']:.2f}"
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--lr_quant", type=float, default=0.5)
+    parser.add_argument("--eps_quant", type=float, default=1e-3)
+    parser.add_argument("--lr_other", type=float, default=1e-3)
+    parser.add_argument("--eps_other", type=float, default=1e-5)
+    parser.add_argument("--weight_decay_other", type=float, default=1e-4)
+    parser.add_argument("--epochs", type=int, default=850)
+    parser.add_argument("--y", type=float, default=0.015)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--mode", type=str, choices=["train", "eval"], default="train")
+
+    args = parser.parse_args()
+
+    torch.manual_seed(0)
+    torch.cuda.set_device(0)
+    train(args)
